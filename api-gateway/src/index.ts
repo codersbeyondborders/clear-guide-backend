@@ -1,8 +1,10 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import authRoutes from './routes/auth';
 import uploadRoutes from './routes/upload';
 import taskRoutes from './routes/tasks';
 import manualsRoutes from './routes/manuals';
+import hubRoutes from './routes/hub';
 
 const fastify = Fastify({
   logger: true
@@ -11,17 +13,23 @@ const fastify = Fastify({
 // Configure CORS
 fastify.register(cors, {
   origin: '*', // For production, replace with frontend URL
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
 });
 
 fastify.get('/health', async () => {
   return { status: 'ok', service: 'api-gateway' };
 });
 
-// Register routes
-fastify.register(uploadRoutes, { prefix: '/upload' });
-fastify.register(taskRoutes, { prefix: '/tasks' });
-fastify.register(manualsRoutes, { prefix: '/manuals' });
+// Register routes cleanly
+fastify.register(authRoutes, { prefix: '/api/auth' });
+fastify.register(uploadRoutes, { prefix: '/api/upload' });
+fastify.register(taskRoutes, { prefix: '/api/tasks' });
+fastify.register(manualsRoutes, { prefix: '/api/manuals' });
+fastify.register(hubRoutes, { prefix: '/api/hub' });
+
+
+
+
 
 const start = async () => {
   try {
