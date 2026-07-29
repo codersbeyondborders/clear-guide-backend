@@ -1,7 +1,8 @@
 import os
 import base64
 import json
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -13,6 +14,7 @@ from agents.visual_search_agent import identify_and_search_part
 from agents.dynamic_video_generator import generate_step_walkthrough_video
 from agents.accessibility_agent import simplify_and_translate
 from agents.language_translation_agent import translate_content
+from agents.ifixit_ingestion_agent import ingest_ifixit_guide, search_ifixit_cache
 
 # Initialize Firebase
 if not firebase_admin._apps:
@@ -27,19 +29,34 @@ class ProcessManualRequest(BaseModel):
     manualId: str
     storageUrl: str
 
+security = HTTPBearer(auto_error=False)
+
+async def verify_agent_secret(credentials: HTTPAuthorizationCredentials = Depends(security), request: Request = None):
+    """
+    Middleware to verify that the request comes from an authorized caller 
+    (like the API Gateway or Cloud Tasks) by checking the shared AGENT_MESH_SECRET.
+    """
+    secret = os.getenv("AGENT_MESH_SECRET")
+    is_dev = os.getenv("ENVIRONMENT") == "development" or os.getenv("NODE_ENV") != "production"
+    
+    if secret:
+        if not credentials or credentials.scheme.lower() != "bearer" or credentials.credentials != secret:
+            raise HTTPException(status_code=403, detail="Unauthorized task request: Invalid or missing Agent Mesh Secret")
+    elif not is_dev:
+        # Require secret in production
+        raise HTTPException(status_code=500, detail="AGENT_MESH_SECRET is not configured in production")
+        
+    return True
+
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "ai-agent-mesh"}
 
-@app.post("/process-manual")
+@app.post("/process-manual", dependencies=[Depends(verify_agent_secret)])
 async def process_manual(request: Request):
     """
     Webhook endpoint for Google Cloud Tasks / Gateway trigger.
     """
-    # Verify authorization header or Cloud Tasks header in production
-    is_dev = os.getenv("ENVIRONMENT") == "development" or os.getenv("NODE_ENV") != "production"
-    if not request.headers.get("X-CloudTasks-TaskName") and not is_dev:
-        raise HTTPException(status_code=403, detail="Unauthorized task request")
 
     try:
         body = await request.json()
@@ -67,7 +84,7 @@ async def process_manual(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/community-reply")
+@app.post("/community-reply", dependencies=[Depends(verify_agent_secret)])
 async def community_reply(request: Request):
     """
     Triggers GuideBot AI Moderator response to community forum posts.
@@ -87,7 +104,7 @@ async def community_reply(request: Request):
         print(f"Error in /community-reply: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/visual-search")
+@app.post("/visual-search", dependencies=[Depends(verify_agent_secret)])
 async def visual_search(request: Request):
     """
     Camera photo visual search and part identification endpoint.
@@ -106,7 +123,7 @@ async def visual_search(request: Request):
         print(f"Error in /visual-search: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate-video")
+@app.post("/generate-video", dependencies=[Depends(verify_agent_secret)])
 async def generate_video(request: Request):
     """
     Automated step-by-step SVG frame walkthrough & voiceover video generator.
@@ -123,7 +140,7 @@ async def generate_video(request: Request):
         print(f"Error in /generate-video: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/translate")
+@app.post("/translate", dependencies=[Depends(verify_agent_secret)])
 async def translate_text(request: Request):
     """
     Technical jargon simplification (WCAG 8th-grade level) and multi-language translation.
@@ -143,7 +160,7 @@ async def translate_text(request: Request):
         print(f"Error in /translate: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/language-translate")
+@app.post("/language-translate", dependencies=[Depends(verify_agent_secret)])
 async def language_translate(request: Request):
     """
     Dedicated Language-Translation-Agent for real-time frontend UI and content translation.
@@ -163,8 +180,18 @@ async def language_translate(request: Request):
         print(f"Error in /language-translate: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
-
-
-
-
+@app.post("/ifixit/ingest", dependencies=[Depends(verify_agent_secret)])
+async def ifixit_ingest(request: Request):
+    """
+    Ingests, transforms, and stores an iFixit guide as vector nodes in Firestore with a 30-day TTL.
+    """
+    try:
+        body = await request.json()
+        guide_id = body.get("guideId")
+        if not guide_id:
+            raise ValueError("Missing guideId")
+        result = await ingest_ifixit_guide(guide_id)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        print(f"Error in /ifixit/ingest: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

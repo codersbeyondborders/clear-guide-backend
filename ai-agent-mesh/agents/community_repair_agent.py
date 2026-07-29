@@ -2,6 +2,7 @@ import os
 import firebase_admin
 from firebase_admin import firestore
 from agents.vertex_ai_helper import generate_ai_content, get_embedding_vector
+from agents.ifixit_ingestion_agent import search_ifixit_cache
 
 
 
@@ -35,7 +36,7 @@ async def generate_guidebot_reply(post_id: str, body: str, manual_id: str = None
 
     try:
         # 1. Generate 768-dim query vector embedding for post body using Vertex AI TextEmbeddingModel
-        dummy_embedding = get_embedding_vector(body)
+        query_embedding = get_embedding_vector(body)
 
         # 2. Execute pgvector cosine similarity search over manual_chunks
         context_snippets = []
@@ -43,7 +44,7 @@ async def generate_guidebot_reply(post_id: str, body: str, manual_id: str = None
             conn = get_db_connection()
             if conn:
                 cur = conn.cursor()
-                vector_str = "[" + ",".join(map(str, dummy_embedding)) + "]"
+                vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
 
                 if manual_id:
                     cur.execute("""
@@ -67,6 +68,20 @@ async def generate_guidebot_reply(post_id: str, body: str, manual_id: str = None
         except Exception as db_err:
             print(f"Database pgvector query notice in GuideBot: {db_err}")
 
+        # 2b. Execute search on ifixit_cache in Firestore for iFixit guide context
+        ifixit_citations = []
+        try:
+            ifixit_docs = await search_ifixit_cache(body)
+            for doc in ifixit_docs:
+                transformed = doc.get("transformed_content", {})
+                title = transformed.get("title", "")
+                url = doc.get("canonical_url", "")
+                if title:
+                    context_snippets.append(f"iFixit Guide ({title}): {transformed.get('summary', '')}")
+                    ifixit_citations.append(f"Powered by iFixit: [{title}]({url})")
+        except Exception as ifixit_err:
+            print(f"Firestore iFixit cache query notice in GuideBot: {ifixit_err}")
+
         context_text = "\n\n".join(context_snippets) if context_snippets else "Standard equipment maintenance and safety protocols."
 
         # 3. Synthesize diagnostic response using Vertex AI Gemini 1.5 RAG
@@ -81,12 +96,14 @@ async def generate_guidebot_reply(post_id: str, body: str, manual_id: str = None
             f"Retrieved Technical Manual Context:\n{context_text}\n\n"
             "Synthesize a helpful, polite, step-by-step diagnostic recommendation (under 250 words)."
         )
-        ai_resp = generate_ai_content(prompt)
+        ai_resp = generate_ai_content(prompt, model_name="gemini-1.5-pro")
         if ai_resp:
             guidebot_text += ai_resp
         else:
-            guidebot_text += "Inspect wiring connections, verify pressure values, and check maintenance schedules in your product manual."
+            guidebot_text += "I apologize, but I am currently unable to process your request. Please check the standard equipment manual."
 
+        if ifixit_citations:
+            guidebot_text += "\n\n" + "\n".join(ifixit_citations)
 
         # 4. Post response as GuideBot comment in Firestore
         now = firestore.SERVER_TIMESTAMP

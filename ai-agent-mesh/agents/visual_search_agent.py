@@ -23,28 +23,57 @@ def get_db_connection():
 
 async def identify_and_search_part(image_base64: str, category: str = None):
     """
-    Analyzes camera image with Gemini 1.5 Flash Vision, generates part embedding,
+    Analyzes camera image with Gemini 1.5 Pro Vision, generates part embedding,
     and executes pgvector similarity search to find matching manual sections & fix steps.
     """
     clean_b64 = image_base64.split(",")[-1] if "," in image_base64 else image_base64
-
-    identified_part = "Fuel Injector Valve Assembly"
-    confidence_score = 0.92
-    visual_description = "High-pressure fuel injection valve with O-ring seal"
-    fault_diagnosis = "Potential pressure seal wear or carbon residue accumulation"
 
     prompt = (
         "You are an expert equipment maintenance technician and visual part identification agent.\n"
         "Analyze this camera photo. Identify the machinery type, specific part name, part condition, "
         "and fault diagnosis if damage or error codes are visible.\n"
-        "Format output as clean text stating part name and diagnostic observation."
+        "Format your ENTIRE output as a single, valid JSON object with the following schema:\n"
+        "{\n"
+        '  "identified_part": "Name of the part",\n'
+        '  "confidence_score": 0.95,\n'
+        '  "visual_description": "Detailed visual description",\n'
+        '  "fault_diagnosis": "Diagnosis of any visible issues",\n'
+        '  "troubleshooting_steps": ["Step 1", "Step 2"]\n'
+        "}\n"
+        "Return ONLY the valid JSON object, without any markdown formatting."
     )
-    ai_vision = generate_ai_content(prompt, clean_b64)
-    if ai_vision:
-        visual_description = ai_vision
-        lines = [l.strip() for l in ai_vision.split("\n") if l.strip()]
-        if lines:
-            identified_part = lines[0].replace("#", "").replace("*", "").strip()
+    
+    ai_vision_json_str = generate_ai_content(
+        prompt=prompt, 
+        file_base64=clean_b64, 
+        mime_type="image/jpeg", 
+        model_name="gemini-1.5-pro"
+    )
+
+    # Defaults
+    identified_part = "Unknown Part"
+    confidence_score = 0.0
+    visual_description = "Could not parse visual description."
+    fault_diagnosis = "No diagnosis available."
+    troubleshooting_steps = ["1. Please refer to standard manual."]
+
+    try:
+        clean_json_str = ai_vision_json_str.strip()
+        if clean_json_str.startswith("```json"):
+            clean_json_str = clean_json_str[7:]
+        if clean_json_str.startswith("```"):
+            clean_json_str = clean_json_str[3:]
+        if clean_json_str.endswith("```"):
+            clean_json_str = clean_json_str[:-3]
+            
+        parsed_data = json.loads(clean_json_str.strip())
+        identified_part = parsed_data.get("identified_part", identified_part)
+        confidence_score = float(parsed_data.get("confidence_score", confidence_score))
+        visual_description = parsed_data.get("visual_description", visual_description)
+        fault_diagnosis = parsed_data.get("fault_diagnosis", fault_diagnosis)
+        troubleshooting_steps = parsed_data.get("troubleshooting_steps", troubleshooting_steps)
+    except Exception as parse_err:
+        print(f"Error parsing JSON from Gemini Visual Search: {parse_err}")
 
     # 2. Compute 768-dim text embedding for identified part feature text using Vertex AI
     query_text = f"{identified_part} {visual_description}"
@@ -87,9 +116,5 @@ async def identify_and_search_part(image_base64: str, category: str = None):
         "matchedManualId": matched_manual_id,
         "relevantSection": relevant_section,
         "matchingChunks": matching_chunks,
-        "troubleshootingSteps": [
-            "1. Isolate main power and release system fuel pressure.",
-            "2. Inspect the fuel injector valve O-ring seal for cracks or micro-leaks.",
-            "3. Clean carbon residue using approved solvent or replace with part P-1."
-        ]
+        "troubleshootingSteps": troubleshooting_steps
     }

@@ -4,6 +4,9 @@ import { manuals, manualChunks } from '../lib/schema';
 import { verifyAuth, optionalAuth } from '../lib/auth';
 import { hybridSearch } from '../lib/vector';
 import { eq, desc, and } from 'drizzle-orm';
+import { dispatchToAgent } from '../lib/agentClient';
+import { firestore } from '../lib/firebase';
+import { randomUUID } from 'crypto';
 
 export default async function (fastify: FastifyInstance) {
   /**
@@ -43,6 +46,90 @@ export default async function (fastify: FastifyInstance) {
     } catch (error) {
       request.log.error({ err: error }, 'Failed to fetch manuals');
       return reply.status(500).send({ error: 'Failed to fetch manuals' });
+    }
+  });
+
+  /**
+   * POST /
+   * Create a new manual and optionally trigger AI PDF parser
+   */
+  fastify.post('/', { preHandler: [verifyAuth] }, async (request, reply) => {
+    const user = request.user!;
+    const body = request.body as any;
+    const manualId = randomUUID();
+
+    try {
+      // 1. Save to PostgreSQL
+      await db.insert(manuals).values({
+        id: manualId,
+        userId: user.uid,
+        title: body.productName || 'Untitled Manual',
+        storageUrl: body.originalFileUrl || '',
+        status: body.status === 'published' ? 'published' : 'pending',
+        createdAt: new Date(),
+      });
+
+      // 2. Save metadata to Firestore
+      await firestore.collection('manuals').doc(manualId).set({
+        ...body,
+        userId: user.uid,
+        createdAt: new Date(),
+      });
+
+      // 3. Trigger AI PDF Parser if a file was uploaded
+      if (body.originalFileUrl && body.uploadMethod === 'upload') {
+        const aiWorkerUrl = process.env.AGENT_PDF_PARSER_URL || process.env.AI_AGENT_URL || 'http://localhost:8001/process-manual';
+        
+        dispatchToAgent(aiWorkerUrl, { manualId, storageUrl: body.originalFileUrl }, 3)
+          .catch((err) => request.log.error({ err }, 'Failed to dispatch AI PDF Parser'));
+      }
+
+      return reply.send({ success: true, id: manualId });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to create manual');
+      return reply.status(500).send({ error: 'Failed to create manual' });
+    }
+  });
+
+  /**
+   * PUT /:id
+   * Update an existing manual
+   */
+  fastify.put('/:id', { preHandler: [verifyAuth] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const user = request.user!;
+    const body = request.body as any;
+
+    try {
+      // Verify ownership
+      const [existing] = await db.select().from(manuals).where(eq(manuals.id, id));
+      if (!existing || existing.userId !== user.uid) {
+        return reply.status(403).send({ error: 'Forbidden' });
+      }
+
+      await db.update(manuals).set({
+        title: body.productName || existing.title,
+        storageUrl: body.originalFileUrl || existing.storageUrl,
+        status: body.status === 'published' ? 'published' : existing.status,
+      }).where(eq(manuals.id, id));
+
+      await firestore.collection('manuals').doc(id).update({
+        ...body,
+        updatedAt: new Date(),
+      });
+
+      // Re-trigger AI if a new file was uploaded
+      if (body.originalFileUrl && body.originalFileUrl !== existing.storageUrl && body.uploadMethod === 'upload') {
+        const aiWorkerUrl = process.env.AGENT_PDF_PARSER_URL || process.env.AI_AGENT_URL || 'http://localhost:8001/process-manual';
+        
+        dispatchToAgent(aiWorkerUrl, { manualId: id, storageUrl: body.originalFileUrl }, 3)
+          .catch((err) => request.log.error({ err }, 'Failed to dispatch AI PDF Parser'));
+      }
+
+      return reply.send({ success: true, id });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to update manual');
+      return reply.status(500).send({ error: 'Failed to update manual' });
     }
   });
 
@@ -97,17 +184,7 @@ export default async function (fastify: FastifyInstance) {
         ? process.env.AI_AGENT_URL.replace('/process-manual', '/visual-search')
         : 'http://localhost:8000/visual-search');
 
-      const response = await fetch(aiWorkerUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image, category }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`AI Agent Mesh returned HTTP ${response.status}`);
-      }
-
-      const result = await response.json();
+      const result = await dispatchToAgent(aiWorkerUrl, { image, category });
       return reply.send(result);
     } catch (error) {
       request.log.error({ err: error }, 'Failed to execute visual search');
@@ -131,17 +208,7 @@ export default async function (fastify: FastifyInstance) {
         ? process.env.AI_AGENT_URL.replace('/process-manual', '/generate-video')
         : 'http://localhost:8000/generate-video');
 
-      const response = await fetch(aiWorkerUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ manualId, procedureTitle, repairSteps }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`AI Agent Mesh returned HTTP ${response.status}`);
-      }
-
-      const result = await response.json();
+      const result = await dispatchToAgent(aiWorkerUrl, { manualId, procedureTitle, repairSteps });
       return reply.send(result);
     } catch (error) {
       request.log.error({ err: error }, 'Failed to generate step-by-step video');
@@ -169,17 +236,7 @@ export default async function (fastify: FastifyInstance) {
         ? process.env.AI_AGENT_URL.replace('/process-manual', '/translate')
         : 'http://localhost:8000/translate');
 
-      const response = await fetch(aiWorkerUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, targetLanguage, readingLevel }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`AI Agent Mesh returned HTTP ${response.status}`);
-      }
-
-      const result = await response.json();
+      const result = await dispatchToAgent(aiWorkerUrl, { text, targetLanguage, readingLevel });
       return reply.send(result);
     } catch (error) {
       request.log.error({ err: error }, 'Failed to simplify and translate text');
@@ -207,18 +264,7 @@ export default async function (fastify: FastifyInstance) {
         ? process.env.AI_AGENT_URL.replace('/process-manual', '/language-translate')
         : 'http://localhost:8000/language-translate');
 
-      const response = await fetch(aiWorkerUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, targetLanguage, sourceLanguage }),
-      });
-
-
-      if (!response.ok) {
-        throw new Error(`AI Agent Mesh returned HTTP ${response.status}`);
-      }
-
-      const result = await response.json();
+      const result = await dispatchToAgent(aiWorkerUrl, { text, targetLanguage, sourceLanguage });
       return reply.send(result);
     } catch (error) {
       request.log.error({ err: error }, 'Failed to translate content');

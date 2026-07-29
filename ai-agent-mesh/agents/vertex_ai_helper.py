@@ -41,6 +41,7 @@ _genai_client = None
 
 try:
     from google import genai as google_genai
+    from google.genai import types as genai_types
     GENAI_AVAILABLE = True
 except ImportError:
     pass
@@ -65,7 +66,8 @@ def _get_genai_client():
 
 def generate_ai_content(
     prompt: str,
-    image_base64: str = None,
+    file_base64: str = None,
+    mime_type: str = "application/pdf",
     model_name: str = "gemini-1.5-flash"
 ) -> str:
     """
@@ -79,9 +81,9 @@ def generate_ai_content(
         try:
             vertex_model = GenerativeModel(model_name)
             contents = []
-            if image_base64:
-                img_bytes = base64.b64decode(image_base64)
-                contents.append(Part.from_data(img_bytes, mime_type="image/jpeg"))
+            if file_base64:
+                file_bytes = base64.b64decode(file_base64)
+                contents.append(Part.from_data(file_bytes, mime_type=mime_type))
             contents.append(prompt)
             response = vertex_model.generate_content(contents)
             if response and response.text:
@@ -93,17 +95,22 @@ def generate_ai_content(
     client = _get_genai_client()
     if client:
         try:
+            contents = []
+            if file_base64:
+                file_bytes = base64.b64decode(file_base64)
+                contents.append(genai_types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
+            contents.append(prompt)
+
             response = client.models.generate_content(
                 model=model_name,
-                contents=prompt,
+                contents=contents,
             )
             if response and response.text:
                 return response.text.strip()
         except Exception as err:
             print(f"[google.genai] generate_content notice: {err}")
 
-
-    return ""
+    raise RuntimeError("AI content generation failed across all available SDKs. Check your credentials and quotas.")
 
 
 def get_embedding_vector(text: str, model_name: str = "text-embedding-004") -> list:
@@ -136,5 +143,52 @@ def get_embedding_vector(text: str, model_name: str = "text-embedding-004") -> l
         except Exception as err:
             print(f"[google.genai] embed_content notice: {err}")
 
-    # -- Offline deterministic fallback (development only) --
-    return [0.01 * (i % 10) for i in range(768)]
+    raise RuntimeError("AI embedding generation failed across all available SDKs. Check your credentials and quotas.")
+
+
+# ---------------------------------------------------------------------------
+# SVG Generation Utilities
+# ---------------------------------------------------------------------------
+
+SVG_PROMPT_RULES = (
+    "CRITICAL SVG GENERATION RULES:\n"
+    "1. You MUST include xmlns=\"http://www.w3.org/2000/svg\" and viewBox=\"0 0 800 500\".\n"
+    "2. Use a sleek dark theme: Set the background to fill=\"#090d16\", use cyan/blue (e.g., #38bdf8, #0369a1) for primary shapes/lines, and white (#ffffff) for text.\n"
+    "3. Use ONLY basic, universally compatible SVG shapes: <rect>, <circle>, <path>, <line>, <text>, <g>. Do NOT use complex filters or unsupported CSS.\n"
+    "4. If returning JSON, ensure all SVG attribute quotes are properly escaped (e.g., using single quotes like fill='red' or escaped double quotes).\n"
+    "5. Output ONLY the valid raw <svg>...</svg> element, no markdown fencing."
+)
+
+def sanitize_svg_markup(raw_str: str) -> str:
+    """
+    Cleans up LLM-generated SVG markup by stripping markdown fencing
+    and ensuring the root <svg> tags exist.
+    """
+    if not raw_str:
+        return ""
+
+    clean_str = raw_str.strip()
+    if clean_str.startswith("```svg"):
+        clean_str = clean_str[6:]
+    elif clean_str.startswith("```xml"):
+        clean_str = clean_str[6:]
+    elif clean_str.startswith("```html"):
+        clean_str = clean_str[7:]
+    elif clean_str.startswith("```"):
+        clean_str = clean_str[3:]
+    
+    if clean_str.endswith("```"):
+        clean_str = clean_str[:-3]
+        
+    clean_str = clean_str.strip()
+    
+    # Clean up potentially escaped characters from JSON hallucination
+    clean_str = clean_str.replace('\\"', '"').replace("\\'", "'").replace("\\n", "\n").replace("\\t", "\t")
+    
+    if not clean_str.startswith("<svg"):
+        clean_str = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" class="w-full h-auto border rounded-xl bg-slate-950 p-4">{clean_str}'
+        
+    if not clean_str.endswith("</svg>"):
+        clean_str += "</svg>"
+        
+    return clean_str

@@ -4,6 +4,7 @@ import { verifyAuth, optionalAuth } from '../lib/auth';
 import { db } from '../lib/db';
 import { manuals } from '../lib/schema';
 import { eq, desc, ilike, or, and } from 'drizzle-orm';
+import { dispatchToAgent } from '../lib/agentClient';
 
 interface PostMedia {
   type: 'image' | 'video';
@@ -211,15 +212,11 @@ export default async function hubRoutes(fastify: FastifyInstance) {
           ? process.env.AI_AGENT_URL.replace('/process-manual', '/community-reply')
           : 'http://localhost:8004/community-reply');
 
-      fetch(aiWorkerUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      dispatchToAgent(aiWorkerUrl, {
           postId: postRef.id,
           body: input.body?.trim() || '',
           manualId: input.manualId || null,
-        }),
-      }).catch((err) => {
+      }, 3).catch((err) => {
         request.log.error({ err, postId: postRef.id }, 'GuideBot AI trigger notice');
       });
 

@@ -5,6 +5,7 @@ import uploadRoutes from './routes/upload';
 import taskRoutes from './routes/tasks';
 import manualsRoutes from './routes/manuals';
 import hubRoutes from './routes/hub';
+import ifixitRoutes from './routes/ifixit';
 
 const fastify = Fastify({
   logger: true
@@ -26,6 +27,7 @@ fastify.register(uploadRoutes, { prefix: '/api/upload' });
 fastify.register(taskRoutes, { prefix: '/api/tasks' });
 fastify.register(manualsRoutes, { prefix: '/api/manuals' });
 fastify.register(hubRoutes, { prefix: '/api/hub' });
+fastify.register(ifixitRoutes, { prefix: '/api/ifixit' });
 
 
 

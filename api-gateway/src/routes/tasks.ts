@@ -3,6 +3,7 @@ import { CloudTasksClient } from '@google-cloud/tasks';
 import { db } from '../lib/db';
 import { manuals } from '../lib/schema';
 import { verifyAuth, requireRole } from '../lib/auth';
+import { dispatchToAgent } from '../lib/agentClient';
 
 let tasksClient: CloudTasksClient | null = null;
 try {
@@ -64,6 +65,7 @@ export default async function (fastify: FastifyInstance) {
                 url: aiWorkerUrl,
                 headers: {
                   'Content-Type': 'application/json',
+                  ...(process.env.AGENT_MESH_SECRET ? { 'Authorization': `Bearer ${process.env.AGENT_MESH_SECRET}` } : {}),
                 },
                 body: Buffer.from(JSON.stringify({ manualId, storageUrl })).toString('base64'),
               },
@@ -78,16 +80,10 @@ export default async function (fastify: FastifyInstance) {
 
         // Fallback: Trigger direct HTTP POST to AI worker (non-blocking)
         if (dispatchedVia === 'local_fallback') {
-          fetch(aiWorkerUrl, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-CloudTasks-TaskName': taskName,
-            },
-            body: JSON.stringify({ manualId, storageUrl }),
-          }).catch((err) => {
-            request.log.error({ err, aiWorkerUrl }, 'Failed to dispatch direct HTTP request to AI Agent Mesh');
-          });
+          dispatchToAgent(aiWorkerUrl, { manualId, storageUrl }, 3, { 'X-CloudTasks-TaskName': taskName })
+            .catch((err) => {
+              request.log.error({ err, aiWorkerUrl }, 'Failed to dispatch direct HTTP request to AI Agent Mesh');
+            });
         }
 
         return reply.send({

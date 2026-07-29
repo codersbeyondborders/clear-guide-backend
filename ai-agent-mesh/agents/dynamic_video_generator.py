@@ -2,7 +2,7 @@ import os
 import json
 import base64
 import io
-from agents.vertex_ai_helper import generate_ai_content
+from agents.vertex_ai_helper import generate_ai_content, SVG_PROMPT_RULES, sanitize_svg_markup
 
 
 
@@ -48,32 +48,6 @@ def synthesize_mp3_base64(text: str, lang: str = "en") -> str:
     dummy_bytes = f"AUDIO_SYNTHESIS_FOR: {text}".encode("utf-8")
     return f"data:audio/mp3;base64,{base64.b64encode(dummy_bytes).decode('utf-8')}"
 
-def compose_svg_frame(step_num: int, total_steps: int, step_title: str, tool_required: str) -> str:
-    """
-    Composes interactive SVG frame markup for a specific repair step.
-    """
-    progress_width = int((step_num / max(total_steps, 1)) * 740)
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" class="w-full h-auto border rounded-xl bg-slate-950 text-white p-4">
-  <rect width="100%" height="100%" fill="#090d16" rx="12"/>
-  
-  <!-- Header Bar -->
-  <text x="30" y="40" fill="#38bdf8" font-size="18" font-weight="bold">Step {step_num} of {total_steps}: {step_title}</text>
-  <rect x="30" y="55" width="740" height="6" fill="#1e293b" rx="3"/>
-  <rect x="30" y="55" width="{progress_width}" height="6" fill="#38bdf8" rx="3"/>
-
-  <!-- Step Visual Graphic -->
-  <rect x="200" y="100" width="400" height="260" fill="none" stroke="#0284c7" stroke-width="3" stroke-dasharray="8,8" rx="10"/>
-  <circle cx="400" cy="230" r="60" fill="#0369a1" stroke="#38bdf8" stroke-width="4"/>
-  <text x="400" y="235" fill="#ffffff" font-size="22" text-anchor="middle" font-weight="bold">STEP {step_num}</text>
-  
-  <!-- Tool Highlight Badge -->
-  <rect x="30" y="420" width="300" height="40" fill="#1e293b" stroke="#f59e0b" stroke-width="2" rx="6"/>
-  <text x="45" y="445" fill="#f59e0b" font-size="13" font-weight="bold">🛠️ Tool Required: {tool_required}</text>
-
-  <!-- Safety Badge -->
-  <rect x="520" y="420" width="250" height="40" fill="#1e293b" stroke="#10b981" stroke-width="2" rx="6"/>
-  <text x="535" y="445" fill="#10b981" font-size="13" font-weight="bold">🛡️ Safety Gear Required</text>
-</svg>"""
 
 async def generate_step_walkthrough_video(manual_id: str, procedure_title: str = None, repair_steps: list = None):
     """
@@ -111,7 +85,30 @@ async def generate_step_walkthrough_video(manual_id: str, procedure_title: str =
             narration = ai_narr
 
 
-        svg_markup = compose_svg_frame(step_num, total_steps, f"Step {step_num}", tool)
+        svg_prompt = (
+            f"You are an expert technical illustrator.\n"
+            f"Create an interactive SVG frame (800x500) for a repair video.\n"
+            f"Procedure: {title}\n"
+            f"Current Step ({step_num}/{total_steps}): {step_desc}\n"
+            f"Tool Required: {tool}\n"
+            f"Include a progress bar showing step {step_num} of {total_steps}.\n"
+            f"{SVG_PROMPT_RULES}"
+        )
+        ai_svg = generate_ai_content(prompt=svg_prompt, model_name="gemini-1.5-pro")
+        
+        if ai_svg:
+            svg_markup = sanitize_svg_markup(ai_svg)
+        else:
+            # Fallback if generation completely fails
+            progress_width = int((step_num / max(total_steps, 1)) * 740)
+            svg_markup = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" class="w-full h-auto border rounded-xl bg-slate-950 text-white p-4">
+              <rect width="100%" height="100%" fill="#090d16" rx="12"/>
+              <text x="30" y="40" fill="#38bdf8" font-size="18" font-weight="bold">Step {step_num} of {total_steps}: Step {step_num}</text>
+              <rect x="30" y="55" width="740" height="6" fill="#1e293b" rx="3"/>
+              <rect x="30" y="55" width="{progress_width}" height="6" fill="#38bdf8" rx="3"/>
+              <rect x="200" y="100" width="400" height="260" fill="none" stroke="#ef4444" stroke-width="3" stroke-dasharray="8,8" rx="10"/>
+              <text x="400" y="235" fill="#ffffff" font-size="22" text-anchor="middle" font-weight="bold">SVG GENERATION FAILED</text>
+            </svg>"""
         audio_url = synthesize_mp3_base64(narration)
 
         frames.append({

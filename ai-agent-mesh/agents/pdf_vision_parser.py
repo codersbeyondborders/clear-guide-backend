@@ -4,7 +4,7 @@ import base64
 from google.cloud import storage
 import firebase_admin
 from firebase_admin import firestore
-from agents.vertex_ai_helper import generate_ai_content, get_embedding_vector
+from agents.vertex_ai_helper import generate_ai_content, get_embedding_vector, SVG_PROMPT_RULES, sanitize_svg_markup
 
 
 
@@ -79,33 +79,7 @@ def download_pdf_bytes(storage_url: str) -> bytes:
 
     return f"Manual document payload for {storage_url}".encode("utf-8")
 
-def generate_svg_diagram(manual_id: str, title: str) -> str:
-    """
-    Generates interactive SVG exploded diagram markup with labeled part callouts.
-    """
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" class="w-full h-auto border rounded-xl bg-slate-900 text-white p-4">
-  <rect width="100%" height="100%" fill="#0f172a" rx="12"/>
-  <text x="30" y="40" fill="#38bdf8" font-size="20" font-weight="bold">{title} - Exploded Assembly Diagram</text>
-  <!-- Component Housing -->
-  <rect x="250" y="150" width="300" height="200" fill="none" stroke="#38bdf8" stroke-width="3" stroke-dasharray="6,6" rx="8"/>
-  <text x="400" y="250" fill="#94a3b8" font-size="14" text-anchor="middle">Main Drive Housing Assembly</text>
-  <!-- Part 1: Fuel Injector Valve -->
-  <circle cx="180" cy="200" r="30" fill="#0284c7" stroke="#38bdf8" stroke-width="2"/>
-  <text x="180" y="205" fill="#ffffff" font-size="12" text-anchor="middle" font-weight="bold">P-1</text>
-  <line x1="210" y1="200" x2="250" y2="200" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="180" y="250" fill="#cbd5e1" font-size="11" text-anchor="middle">Fuel Injector Valve</text>
-  <!-- Part 2: High-Pressure Seal Filter -->
-  <rect x="580" y="180" width="80" height="40" fill="#0369a1" stroke="#38bdf8" stroke-width="2" rx="4"/>
-  <text x="620" y="205" fill="#ffffff" font-size="12" text-anchor="middle" font-weight="bold">P-2</text>
-  <line x1="550" y1="200" x2="580" y2="200" stroke="#f59e0b" stroke-width="2"/>
-  <text x="620" y="240" fill="#cbd5e1" font-size="11" text-anchor="middle">Pressure Seal Filter</text>
-  <!-- Marker Definition -->
-  <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M 0 0 L 10 5 L 0 10 z" fill="#f59e0b"/>
-    </marker>
-  </defs>
-</svg>"""
+
 
 def safe_update_firestore(doc_ref, data):
     if doc_ref:
@@ -134,34 +108,79 @@ async def parse_and_vectorize_pdf(manual_id: str, storage_url: str):
         })
 
         pdf_bytes = download_pdf_bytes(storage_url)
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
         # 2. Multimodal Vision Extraction (50%)
         safe_update_firestore(manual_ref, {
             'status': 'extracting',
             'progressPercent': 50,
-            'message': 'Running Gemini 1.5 Vision document analysis & SVG diagram generation...'
+            'message': 'Running Gemini 1.5 Pro document analysis & SVG diagram generation...'
         })
-
-
-        extracted_sections = []
-        svg_diagram = generate_svg_diagram(manual_id, f"Manual {manual_id}")
 
         prompt = (
             "You are an expert technical documentation parser.\n"
-            "Extract structured sections, safety warnings, maintenance steps, and part numbers from this document.\n"
-            "Format output as clean JSON with keys: 'title', 'safetyRules', 'steps', 'parts'."
+            "Analyze this document and perform the following tasks:\n"
+            "1. Extract structured sections, safety warnings, maintenance steps, and part numbers.\n"
+            "2. Generate an interactive exploded assembly SVG diagram with part callouts based on the machinery described.\n"
+            f"{SVG_PROMPT_RULES}\n"
+            "Format your ENTIRE output as a single, valid JSON object with the following schema:\n"
+            "{\n"
+            '  "specifications": "String describing general system specs and safety rules",\n'
+            '  "maintenance_steps": "String detailing the maintenance steps",\n'
+            '  "parts_list": "String listing parts and numbers",\n'
+            '  "svg_diagram": "<svg>...</svg> (The complete SVG markup string)"\n'
+            "}\n"
+            "Return ONLY the valid JSON object, without any markdown formatting or code blocks."
         )
-        ai_parsed = generate_ai_content(prompt)
-        extracted_sections.append({
-            "title": "General System Specifications & Safety",
-            "content": ai_parsed if ai_parsed else f"Technical manual {manual_id} operating specifications."
-        })
-
-        # Append SVG diagram section
-        extracted_sections.append({
-            "title": "Interactive Exploded Assembly Diagram",
-            "content": f"Exploded SVG Diagram:\n{svg_diagram}"
-        })
+        
+        ai_parsed_json_str = generate_ai_content(
+            prompt=prompt, 
+            file_base64=pdf_b64, 
+            mime_type="application/pdf", 
+            model_name="gemini-1.5-pro"
+        )
+        
+        extracted_sections = []
+        try:
+            # Clean up potential markdown formatting from Gemini
+            clean_json_str = ai_parsed_json_str.strip()
+            if clean_json_str.startswith("```json"):
+                clean_json_str = clean_json_str[7:]
+            if clean_json_str.startswith("```"):
+                clean_json_str = clean_json_str[3:]
+            if clean_json_str.endswith("```"):
+                clean_json_str = clean_json_str[:-3]
+                
+            parsed_data = json.loads(clean_json_str.strip())
+            
+            extracted_sections.append({
+                "title": "General System Specifications & Safety",
+                "content": parsed_data.get("specifications", "No specifications found.")
+            })
+            extracted_sections.append({
+                "title": "Maintenance Procedures",
+                "content": parsed_data.get("maintenance_steps", "No steps found.")
+            })
+            extracted_sections.append({
+                "title": "Parts List",
+                "content": parsed_data.get("parts_list", "No parts found.")
+            })
+            
+            svg_content = parsed_data.get("svg_diagram", "")
+            if svg_content:
+                clean_svg = sanitize_svg_markup(svg_content)
+                extracted_sections.append({
+                    "title": "Interactive Exploded Assembly Diagram",
+                    "content": f"Exploded SVG Diagram:\n{clean_svg}"
+                })
+                
+        except Exception as parse_err:
+            print(f"Error parsing JSON from Gemini: {parse_err}")
+            # Fallback if parsing fails
+            extracted_sections.append({
+                "title": "Raw Document Content",
+                "content": ai_parsed_json_str if ai_parsed_json_str else f"Failed to parse technical manual {manual_id}."
+            })
 
         # 3. Vectorization Phase (80%)
         safe_update_firestore(manual_ref, {
@@ -179,8 +198,8 @@ async def parse_and_vectorize_pdf(manual_id: str, storage_url: str):
                     chunk_id = f"{manual_id}_chunk_{idx}"
                     content = f"[{sec['title']}]\n{sec['content']}"
 
-                    dummy_embedding = get_embedding_vector(content)
-                    embedding_str = "[" + ",".join(map(str, dummy_embedding)) + "]"
+                    embedding_vector = get_embedding_vector(content)
+                    embedding_str = "[" + ",".join(map(str, embedding_vector)) + "]"
 
 
                     cur.execute("""
