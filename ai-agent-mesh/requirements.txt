@@ -16,3 +16,6 @@ firebase-admin>=7.0.0
 # Utilities
 
 gTTS>=2.5.1
+google-cloud-pubsub>=2.20.0
+langgraph>=0.0.35
+langchain-google-genai>=1.0.1

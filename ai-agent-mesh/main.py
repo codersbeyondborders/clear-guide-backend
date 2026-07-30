@@ -15,13 +15,18 @@ from agents.dynamic_video_generator import generate_step_walkthrough_video
 from agents.accessibility_agent import simplify_and_translate
 from agents.language_translation_agent import translate_content
 from agents.ifixit_ingestion_agent import ingest_ifixit_guide, search_ifixit_cache
-
+from agents.fixbot_agent import process_fixbot_chat
 # Initialize Firebase
 if not firebase_admin._apps:
     firebase_admin.initialize_app()
 
-db = firestore.client() if firebase_admin._apps else None
-storage_client = storage.Client() if os.getenv("GOOGLE_CLOUD_PROJECT") else None
+def get_db():
+    if firebase_admin._apps:
+        return firestore.client()
+    return None
+
+def get_storage():
+    return storage.Client() if os.getenv("GOOGLE_CLOUD_PROJECT") else None
 
 app = FastAPI(title="ClearGuide AI Agent Mesh")
 
@@ -72,9 +77,10 @@ async def process_manual(request: Request):
 
     except Exception as e:
         print(f"Error processing task: {e}")
-        if db and 'manual_id' in locals():
+        _db = get_db()
+        if _db and 'manual_id' in locals():
             try:
-                db.collection('manuals').document(manual_id).set({
+                _db.collection('manuals').document(manual_id).set({
                     'status': 'error',
                     'progressPercent': 0,
                     'message': str(e)
@@ -194,4 +200,26 @@ async def ifixit_ingest(request: Request):
         return {"status": "success", "data": result}
     except Exception as e:
         print(f"Error in /ifixit/ingest: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/fixbot/chat", dependencies=[Depends(verify_agent_secret)])
+async def fixbot_chat(request: Request):
+    """
+    Multimodal endpoint for FixBot chat (Text, Image, PDF).
+    """
+    try:
+        body = await request.json()
+        message = body.get("message", "")
+        file_base64 = body.get("file_base64")
+        file_url = body.get("file_url")
+        mime_type = body.get("mime_type")
+        device_context = body.get("device_context")
+
+        if not message and not file_base64 and not file_url:
+            raise ValueError("Missing message or file payload")
+
+        result = await process_fixbot_chat(message, file_base64, file_url, mime_type, device_context)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        print(f"Error in /fixbot/chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))

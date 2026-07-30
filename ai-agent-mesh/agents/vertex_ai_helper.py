@@ -64,9 +64,12 @@ def _get_genai_client():
 # Public API
 # ---------------------------------------------------------------------------
 
+import requests
+
 def generate_ai_content(
     prompt: str,
     file_base64: str = None,
+    file_url: str = None,
     mime_type: str = "application/pdf",
     model_name: str = "gemini-1.5-flash"
 ) -> str:
@@ -75,6 +78,14 @@ def generate_ai_content(
     Priority: Vertex AI Agent Engine → Google Gen AI SDK → empty string fallback.
     """
     _init_vertex()
+
+    if file_url and not file_base64:
+        try:
+            resp = requests.get(file_url, timeout=10)
+            if resp.status_code == 200:
+                file_base64 = base64.b64encode(resp.content).decode('utf-8')
+        except Exception as e:
+            print(f"[VertexAI Helper] Failed to download file_url: {e}")
 
     # -- Vertex AI (primary) --
     if VERTEX_AVAILABLE and _VERTEX_INIT_DONE:

@@ -7,6 +7,7 @@ import { eq, desc, and } from 'drizzle-orm';
 import { dispatchToAgent } from '../lib/agentClient';
 import { firestore } from '../lib/firebase';
 import { randomUUID } from 'crypto';
+import { publishToTopic } from '../lib/pubsub';
 
 export default async function (fastify: FastifyInstance) {
   /**
@@ -78,10 +79,11 @@ export default async function (fastify: FastifyInstance) {
 
       // 3. Trigger AI PDF Parser if a file was uploaded
       if (body.originalFileUrl && body.uploadMethod === 'upload') {
-        const aiWorkerUrl = process.env.AGENT_PDF_PARSER_URL || process.env.AI_AGENT_URL || 'http://localhost:8001/process-manual';
-        
-        dispatchToAgent(aiWorkerUrl, { manualId, storageUrl: body.originalFileUrl }, 3)
-          .catch((err) => request.log.error({ err }, 'Failed to dispatch AI PDF Parser'));
+        publishToTopic('clearguide-events', {
+          type: 'ManualUploadEvent',
+          manualId,
+          storageUrl: body.originalFileUrl
+        }).catch((err) => request.log.error({ err }, 'Failed to dispatch AI PDF Parser to Pub/Sub'));
       }
 
       return reply.send({ success: true, id: manualId });
@@ -120,10 +122,11 @@ export default async function (fastify: FastifyInstance) {
 
       // Re-trigger AI if a new file was uploaded
       if (body.originalFileUrl && body.originalFileUrl !== existing.storageUrl && body.uploadMethod === 'upload') {
-        const aiWorkerUrl = process.env.AGENT_PDF_PARSER_URL || process.env.AI_AGENT_URL || 'http://localhost:8001/process-manual';
-        
-        dispatchToAgent(aiWorkerUrl, { manualId: id, storageUrl: body.originalFileUrl }, 3)
-          .catch((err) => request.log.error({ err }, 'Failed to dispatch AI PDF Parser'));
+        publishToTopic('clearguide-events', {
+          type: 'ManualUploadEvent',
+          manualId: id,
+          storageUrl: body.originalFileUrl
+        }).catch((err) => request.log.error({ err }, 'Failed to dispatch AI PDF Parser to Pub/Sub'));
       }
 
       return reply.send({ success: true, id });
@@ -194,7 +197,7 @@ export default async function (fastify: FastifyInstance) {
 
   /**
    * POST /generate-video
-   * Triggers Dynamic-Video-Generator AI Agent.
+   * Triggers Dynamic-Video-Generator AI Agent via Pub/Sub.
    */
   fastify.post('/generate-video', { preHandler: [optionalAuth] }, async (request, reply) => {
     const { manualId, procedureTitle, repairSteps } = request.body as {
@@ -203,13 +206,25 @@ export default async function (fastify: FastifyInstance) {
       repairSteps?: string[];
     };
 
-    try {
-      const aiWorkerUrl = process.env.AGENT_VIDEO_GENERATOR_URL || (process.env.AI_AGENT_URL 
-        ? process.env.AI_AGENT_URL.replace('/process-manual', '/generate-video')
-        : 'http://localhost:8000/generate-video');
+    if (!manualId) {
+      return reply.status(400).send({ error: 'manualId is required' });
+    }
 
-      const result = await dispatchToAgent(aiWorkerUrl, { manualId, procedureTitle, repairSteps });
-      return reply.send(result);
+    try {
+      // Mark as pending in Firestore
+      await firestore.collection('manuals').doc(manualId).set({
+        videoGenerationStatus: 'pending'
+      }, { merge: true });
+
+      // Publish event
+      await publishToTopic('clearguide-events', {
+        type: 'VideoGenerationRequestedEvent',
+        manualId,
+        title: procedureTitle,
+        steps: repairSteps
+      });
+      
+      return reply.send({ success: true, status: 'pending' });
     } catch (error) {
       request.log.error({ err: error }, 'Failed to generate step-by-step video');
       return reply.status(500).send({ error: 'Failed to generate step-by-step video' });
@@ -297,8 +312,12 @@ export default async function (fastify: FastifyInstance) {
         .from(manualChunks)
         .where(eq(manualChunks.manualId, id));
 
+      const firestoreDoc = await firestore.collection('manuals').doc(id).get();
+      const fsData = firestoreDoc.exists ? firestoreDoc.data() : {};
+
       return reply.send({
         ...manual,
+        ...fsData, // includes videoData if available
         chunks,
       });
     } catch (error) {
@@ -315,9 +334,14 @@ export default async function (fastify: FastifyInstance) {
       if (!manual) {
         return reply.status(404).send({ error: 'Manual not found' });
       }
+      // Also fetch from Firestore for async statuses like videoGenerationStatus
+      const firestoreDoc = await firestore.collection('manuals').doc(id).get();
+      const fsData = firestoreDoc.exists ? firestoreDoc.data() : {};
+
       return reply.send({
         id: manual.id,
         status: manual.status,
+        videoGenerationStatus: fsData?.videoGenerationStatus || 'none',
         updatedAt: manual.createdAt,
       });
     } catch (error) {
@@ -347,8 +371,164 @@ export default async function (fastify: FastifyInstance) {
       return reply.status(500).send({ error: 'Failed to delete manual' });
     }
   });
+
+  /**
+   * POST /:id/analytics/events
+   * Track a view/interaction event for a manual
+   */
+  fastify.post('/:id/analytics/events', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const body = request.body as any;
+
+    try {
+      const newEventRef = firestore.collection('manual_analytics_events').doc();
+      const now = new Date().toISOString();
+      await newEventRef.set({
+        id: newEventRef.id,
+        manualId: id,
+        userSessionId: body.userSessionId || 'unknown',
+        mode: body.mode || 'web',
+        timeSpentSeconds: body.timeSpentSeconds || 0,
+        country: body.country || 'Unknown',
+        device: body.device || 'desktop',
+        language: body.language || 'English',
+        viewedAt: now,
+        createdAt: now,
+      });
+
+      return reply.send({ success: true });
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to track analytics event');
+      return reply.status(500).send({ error: 'Failed to track analytics event' });
+    }
+  });
+
+  /**
+   * GET /:id/analytics
+   * Retrieve aggregated analytics for a manual
+   */
+  fastify.get('/:id/analytics', { preHandler: [verifyAuth] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const user = request.user!;
+
+    try {
+      // 1. Verify ownership
+      const [manual] = await db.select().from(manuals).where(eq(manuals.id, id));
+      if (!manual || (manual.userId !== user.uid && user.role !== 'admin')) {
+        return reply.status(403).send({ error: 'Forbidden' });
+      }
+
+      // 2. Fetch events
+      const snapshot = await firestore.collection('manual_analytics_events')
+        .where('manualId', '==', id)
+        .get();
+
+      const events = snapshot.docs.map(doc => doc.data());
+
+      // 3. Aggregate
+      const totalViews = events.length;
+      const uniqueSessions = new Set(events.map(e => e.userSessionId));
+      const activeUsers = uniqueSessions.size;
+
+      let totalTime = 0;
+      const deviceMap = new Map<string, number>();
+      const countryMap = new Map<string, number>();
+      const langMap = new Map<string, number>();
+      const datesMap = new Map<string, number>();
+
+      events.forEach(e => {
+        totalTime += (e.timeSpentSeconds || 0);
+
+        const d = (e.device || 'desktop').toLowerCase();
+        deviceMap.set(d, (deviceMap.get(d) || 0) + 1);
+
+        const c = e.country || 'Unknown';
+        countryMap.set(c, (countryMap.get(c) || 0) + 1);
+
+        const l = e.language || 'English';
+        langMap.set(l, (langMap.get(l) || 0) + 1);
+
+        const dateStr = (e.createdAt || new Date().toISOString()).split('T')[0];
+        datesMap.set(dateStr, (datesMap.get(dateStr) || 0) + 1);
+      });
+
+      const avgTimeSpentRaw = totalViews > 0 ? Math.floor(totalTime / totalViews) : 0;
+      const mins = Math.floor(avgTimeSpentRaw / 60);
+      const secs = avgTimeSpentRaw % 60;
+      const avgTimeSpent = avgTimeSpentRaw > 0 ? `${mins}m ${secs}s` : '0s';
+
+      const viewsOverTime = Array.from(datesMap.entries())
+        .map(([date, views]) => ({ date, views }))
+        .sort((a, b) => a.date.localeCompare(b.date));
+
+      const deviceBreakdown = Array.from(deviceMap.entries()).map(([device, count]) => ({ device, count }));
+      const countryBreakdown = Array.from(countryMap.entries()).map(([country, views]) => ({ country, views }));
+      const topLanguages = Array.from(langMap.entries()).map(([language, views]) => ({ language, views }));
+
+      // Calculate percentages for deviceStats
+      const mobileCount = deviceMap.get('mobile') || 0;
+      const desktopCount = deviceMap.get('desktop') || 0;
+      const tabletCount = deviceMap.get('tablet') || 0;
+      const totalDevices = (mobileCount + desktopCount + tabletCount) || 1; // avoid / 0
+      
+      const deviceStats = {
+        mobile: Math.round((mobileCount / totalDevices) * 100),
+        desktop: Math.round((desktopCount / totalDevices) * 100),
+        tablet: Math.round((tabletCount / totalDevices) * 100)
+      };
+
+      // Calculate language percentages
+      const languageTotal = topLanguages.reduce((sum, item) => sum + item.views, 0) || 1;
+      const formattedTopLanguages = topLanguages.map(l => ({
+        language: l.language,
+        views: l.views,
+        percentage: Math.round((l.views / languageTotal) * 100)
+      })).sort((a, b) => b.views - a.views);
+
+      // Some static/empty lists for now for unsupported metrics without full pipeline
+      const topAIQueries: { query: string; count: number }[] = [];
+      const ageGroupBreakdown: { group: string; count: number }[] = [];
+      const eventBreakdown: { type: string; count: number }[] = [
+        { type: 'view', count: totalViews }
+      ];
+      const topSections: { title: string; views: number; avgScrollDepth: number }[] = [];
+      
+      // Calculate returning vs new based on frequency of session IDs
+      const sessionCounts = new Map<string, number>();
+      events.forEach(e => {
+        const sid = e.userSessionId;
+        sessionCounts.set(sid, (sessionCounts.get(sid) || 0) + 1);
+      });
+      let returning = 0;
+      let newUsers = 0;
+      sessionCounts.forEach(count => {
+        if (count > 1) returning++;
+        else newUsers++;
+      });
+
+      const responseData = {
+        manualName: manual.title,
+        totalViews,
+        activeUsers,
+        avgTimeSpent,
+        trendViews: 0,
+        trendUsers: 0,
+        viewsOverTime,
+        topAIQueries,
+        deviceBreakdown,
+        countryBreakdown,
+        ageGroupBreakdown,
+        eventBreakdown,
+        topSections,
+        returningVsNew: { returning, new: newUsers },
+        deviceStats,
+        topLanguages: formattedTopLanguages
+      };
+
+      return reply.send(responseData);
+    } catch (error) {
+      request.log.error({ err: error }, 'Failed to fetch analytics');
+      return reply.status(500).send({ error: 'Failed to fetch analytics' });
+    }
+  });
 }
-
-
-
-

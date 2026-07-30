@@ -2,8 +2,30 @@ import requests
 import datetime
 from google.cloud import firestore
 import json
+import os
+import uuid
 
-db = firestore.Client()
+try:
+    import psycopg2
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+
+from agents.vertex_ai_helper import get_embedding_vector
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/clearguide")
+
+_db = None
+def get_db():
+    global _db
+    if _db is None:
+        _db = firestore.Client()
+    return _db
+
+def get_db_connection():
+    if PSYCOPG2_AVAILABLE:
+        return psycopg2.connect(DATABASE_URL)
+    return None
 
 def get_ifixit_guide(guide_id: int):
     url = f"https://www.ifixit.com/api/2.0/guides/{guide_id}"
@@ -49,8 +71,41 @@ async def ingest_ifixit_guide(guide_id: str):
             "media": step.get("media", {})
         })
 
-    # Generate a dummy embedding for now (in production, use Vertex AI or similar)
-    # embedding = await generate_embedding(json.dumps(transformed_steps))
+    # Generate real embeddings for pgvector
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            for i, step in enumerate(transformed_steps):
+                step_title = step.get("title") or f"Step {i+1}"
+                step_lines_text = "\n".join(step.get("lines", []))
+                chunk_content = f"{step_title}\n{step_lines_text}"
+                
+                # Create embedding
+                embedding_vector = get_embedding_vector(chunk_content)
+                vector_str = "[" + ",".join(map(str, embedding_vector)) + "]"
+                
+                chunk_id = f"{guide_id}_{i}"
+                guide_title = guide_data.get("title", "")
+                
+                # Insert into PostgreSQL
+                cur.execute("""
+                    INSERT INTO ifixit_chunks (id, guide_id, title, canonical_url, content, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s::vector)
+                    ON CONFLICT (id) DO UPDATE SET 
+                        content = EXCLUDED.content,
+                        embedding = EXCLUDED.embedding
+                """, (chunk_id, str(guide_id), guide_title, canonical_url, chunk_content, vector_str))
+                
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as db_err:
+            print(f"Failed to insert iFixit guide into pgvector: {db_err}")
+            if conn:
+                conn.rollback()
+
+    # Keep a dummy embedding for the Firestore metadata cache document
     dummy_embedding = [0.0] * 768
 
     expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
@@ -65,7 +120,7 @@ async def ingest_ifixit_guide(guide_id: str):
         "steps": transformed_steps
     }
 
-    doc_ref = db.collection("ifixit_cache").document(str(guide_id))
+    doc_ref = get_db().collection("ifixit_cache").document(str(guide_id))
     doc_ref.set({
         "guide_id": str(guide_id),
         "canonical_url": canonical_url,
@@ -84,17 +139,53 @@ async def ingest_ifixit_guide(guide_id: str):
 
 async def search_ifixit_cache(query: str):
     """
-    Simulates a vector search on the ifixit_cache collection.
+    Performs a vector search on the PostgreSQL ifixit_chunks table.
+    Falls back to Firestore cache if pgvector is unavailable.
     """
-    # In a real vector DB, we'd use the query embedding to find nearest neighbors.
-    # Here we do a basic mock or text search just to illustrate the RAG fetch.
-    cache_ref = db.collection("ifixit_cache").limit(3)
+    conn = get_db_connection()
+    if conn:
+        docs = []
+        try:
+            query_embedding = get_embedding_vector(query)
+            vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+            
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT guide_id, title, canonical_url, content
+                FROM ifixit_chunks 
+                ORDER BY embedding <=> %s::vector 
+                LIMIT 3
+            """, (vector_str,))
+            rows = cur.fetchall()
+            
+            for row in rows:
+                guide_id, title, url, content = row
+                docs.append({
+                    "guide_id": guide_id,
+                    "canonical_url": url,
+                    "transformed_content": {
+                        "title": title,
+                        "summary": content
+                    }
+                })
+                
+            cur.close()
+            conn.close()
+            if docs:
+                return docs
+        except Exception as db_err:
+            print(f"pgvector iFixit search failed: {db_err}")
+            if conn:
+                conn.close()
+
+    # Fallback to firestore mock
+    print("Falling back to Firestore mock search for iFixit")
+    cache_ref = get_db().collection("ifixit_cache").limit(3)
     results = cache_ref.stream()
     
     docs = []
     for doc in results:
         data = doc.to_dict()
-        # Ensure it hasn't expired
         if data.get("expires_at") and data["expires_at"].astimezone(datetime.timezone.utc) > datetime.datetime.now(datetime.timezone.utc):
             docs.append(data)
             

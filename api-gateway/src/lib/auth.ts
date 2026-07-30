@@ -1,5 +1,5 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
-import { auth } from './firebase';
+import { auth, firestore } from './firebase';
 
 export type UserRole = 'admin' | 'enterprise_author' | 'technician' | 'end_user';
 
@@ -29,7 +29,24 @@ export async function verifyAuth(request: FastifyRequest, reply: FastifyReply) {
   const token = authHeader.split('Bearer ')[1];
   try {
     const decoded = await auth.verifyIdToken(token);
-    const role: UserRole = (decoded.role as UserRole) || 'end_user';
+    let role: UserRole = decoded.role as UserRole;
+    
+    // JIT (Just-In-Time) role assignment for newly registered manufacturers
+    if (!role) {
+      try {
+        const mfgDoc = await firestore.collection('manufacturers').doc(decoded.uid).get();
+        if (mfgDoc.exists) {
+          role = 'enterprise_author';
+          // Set custom claims so future tokens have it natively
+          await auth.setCustomUserClaims(decoded.uid, { role: 'enterprise_author' });
+        } else {
+          role = 'end_user';
+        }
+      } catch (dbErr) {
+        request.log.error({ err: dbErr, uid: decoded.uid }, 'Failed to check manufacturer profile during JIT role assignment');
+        role = 'end_user';
+      }
+    }
 
     request.user = {
       uid: decoded.uid,
@@ -82,7 +99,21 @@ export async function optionalAuth(request: FastifyRequest) {
   const token = authHeader.split('Bearer ')[1];
   try {
     const decoded = await auth.verifyIdToken(token);
-    const role: UserRole = (decoded.role as UserRole) || 'end_user';
+    let role: UserRole = decoded.role as UserRole;
+
+    if (!role) {
+      try {
+        const mfgDoc = await firestore.collection('manufacturers').doc(decoded.uid).get();
+        if (mfgDoc.exists) {
+          role = 'enterprise_author';
+          await auth.setCustomUserClaims(decoded.uid, { role: 'enterprise_author' });
+        } else {
+          role = 'end_user';
+        }
+      } catch (dbErr) {
+        role = 'end_user';
+      }
+    }
 
     request.user = {
       uid: decoded.uid,

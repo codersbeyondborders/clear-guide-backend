@@ -32,19 +32,29 @@ export default async function hubRoutes(fastify: FastifyInstance) {
       // Query published manuals from DB
       const allManuals = await db.select().from(manuals).orderBy(desc(manuals.createdAt));
 
+      // Query product_stats from Firestore
+      const statsSnapshot = await firestore.collection('product_stats').get();
+      const statsMap = new Map<string, any>();
+      statsSnapshot.forEach(doc => {
+        statsMap.set(doc.id, doc.data());
+      });
+
       // Map to frontend PublicProduct schema
-      const mappedProducts = allManuals.map(m => ({
-        id: m.id,
-        productName: m.title,
-        brand: 'ClearGuide', // Default or extracted brand
-        productModel: undefined,
-        avgRating: 4.8,
-        reviewCount: 12,
-        threadCount: 5,
-        updatedAt: m.createdAt.toISOString(),
-        manualId: m.id,
-        storageUrl: m.storageUrl,
-      }));
+      const mappedProducts = allManuals.map(m => {
+        const stats = statsMap.get(m.id) || {};
+        return {
+          id: m.id,
+          productName: m.title,
+          brand: 'ClearGuide', // Default or extracted brand
+          productModel: undefined,
+          avgRating: stats.avgRating || 0,
+          reviewCount: stats.reviewCount || 0,
+          threadCount: stats.threadCount || 0,
+          updatedAt: m.createdAt.toISOString(),
+          manualId: m.id,
+          storageUrl: m.storageUrl,
+        };
+      });
 
       const brands = Array.from(new Set(mappedProducts.map(p => p.brand).filter(Boolean)));
 
