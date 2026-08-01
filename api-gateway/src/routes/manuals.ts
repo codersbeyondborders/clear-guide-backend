@@ -175,7 +175,10 @@ export default async function (fastify: FastifyInstance) {
    * POST /visual-search
    * Forwards base64 camera images to Visual-Search-Agent in ai-agent-mesh.
    */
-  fastify.post('/visual-search', { preHandler: [optionalAuth] }, async (request, reply) => {
+  fastify.post('/visual-search', { 
+    preHandler: [optionalAuth],
+    config: { rateLimit: { max: 5, timeWindow: '1 minute' } }
+  }, async (request, reply) => {
     const { image, category } = request.body as { image: string; category?: string };
 
     if (!image) {
@@ -199,7 +202,10 @@ export default async function (fastify: FastifyInstance) {
    * POST /generate-video
    * Triggers Dynamic-Video-Generator AI Agent via Pub/Sub.
    */
-  fastify.post('/generate-video', { preHandler: [optionalAuth] }, async (request, reply) => {
+  fastify.post('/generate-video', { 
+    preHandler: [optionalAuth],
+    config: { rateLimit: { max: 3, timeWindow: '1 minute' } }
+  }, async (request, reply) => {
     const { manualId, procedureTitle, repairSteps } = request.body as {
       manualId?: string;
       procedureTitle?: string;
@@ -389,6 +395,8 @@ export default async function (fastify: FastifyInstance) {
         userSessionId: body.userSessionId || 'unknown',
         mode: body.mode || 'web',
         timeSpentSeconds: body.timeSpentSeconds || 0,
+        scrollDepth: body.scrollDepth || 0,
+        sectionId: body.sectionId || null,
         country: body.country || 'Unknown',
         device: body.device || 'desktop',
         language: body.language || 'English',
@@ -485,13 +493,40 @@ export default async function (fastify: FastifyInstance) {
         percentage: Math.round((l.views / languageTotal) * 100)
       })).sort((a, b) => b.views - a.views);
 
-      // Some static/empty lists for now for unsupported metrics without full pipeline
-      const topAIQueries: { query: string; count: number }[] = [];
+      // Calculate topAIQueries and topSections
+      const queryCounts = new Map<string, number>();
+      const sectionViews = new Map<string, { views: number, scrollSum: number }>();
+      
+      events.forEach(e => {
+        if (e.type === 'chat_query' && e.query) {
+          queryCounts.set(e.query, (queryCounts.get(e.query) || 0) + 1);
+        }
+        if (e.sectionId) {
+          const current = sectionViews.get(e.sectionId) || { views: 0, scrollSum: 0 };
+          current.views += 1;
+          current.scrollSum += (e.scrollDepth || 0);
+          sectionViews.set(e.sectionId, current);
+        }
+      });
+
+      const topAIQueries = Array.from(queryCounts.entries())
+        .map(([query, count]) => ({ query, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 5);
+
+      const topSections = Array.from(sectionViews.entries())
+        .map(([title, data]) => ({
+          title, // using sectionId as title for now
+          views: data.views,
+          avgScrollDepth: Math.round(data.scrollSum / data.views)
+        }))
+        .sort((a, b) => b.views - a.views)
+        .slice(0, 5);
+
       const ageGroupBreakdown: { group: string; count: number }[] = [];
       const eventBreakdown: { type: string; count: number }[] = [
         { type: 'view', count: totalViews }
       ];
-      const topSections: { title: string; views: number; avgScrollDepth: number }[] = [];
       
       // Calculate returning vs new based on frequency of session IDs
       const sessionCounts = new Map<string, number>();

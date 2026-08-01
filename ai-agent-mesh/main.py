@@ -7,6 +7,13 @@ from pydantic import BaseModel
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud import storage
+import sentry_sdk
+
+sentry_sdk.init(
+    dsn=os.getenv("SENTRY_DSN"),
+    traces_sample_rate=1.0,
+    profiles_sample_rate=1.0,
+)
 
 from agents.pdf_vision_parser import parse_and_vectorize_pdf
 from agents.community_repair_agent import generate_guidebot_reply

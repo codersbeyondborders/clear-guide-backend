@@ -140,53 +140,40 @@ async def ingest_ifixit_guide(guide_id: str):
 async def search_ifixit_cache(query: str):
     """
     Performs a vector search on the PostgreSQL ifixit_chunks table.
-    Falls back to Firestore cache if pgvector is unavailable.
     """
     conn = get_db_connection()
-    if conn:
+    if not conn:
+        raise Exception("Database connection failed. PostgreSQL is required for vector search.")
+        
+    try:
         docs = []
-        try:
-            query_embedding = get_embedding_vector(query)
-            vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+        query_embedding = get_embedding_vector(query)
+        vector_str = "[" + ",".join(map(str, query_embedding)) + "]"
+        
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT guide_id, title, canonical_url, content
+            FROM ifixit_chunks 
+            ORDER BY embedding <=> %s::vector 
+            LIMIT 3
+        """, (vector_str,))
+        rows = cur.fetchall()
+        
+        for row in rows:
+            guide_id, title, url, content = row
+            docs.append({
+                "guide_id": guide_id,
+                "canonical_url": url,
+                "transformed_content": {
+                    "title": title,
+                    "summary": content
+                }
+            })
             
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT guide_id, title, canonical_url, content
-                FROM ifixit_chunks 
-                ORDER BY embedding <=> %s::vector 
-                LIMIT 3
-            """, (vector_str,))
-            rows = cur.fetchall()
-            
-            for row in rows:
-                guide_id, title, url, content = row
-                docs.append({
-                    "guide_id": guide_id,
-                    "canonical_url": url,
-                    "transformed_content": {
-                        "title": title,
-                        "summary": content
-                    }
-                })
-                
-            cur.close()
+        cur.close()
+        conn.close()
+        return docs
+    except Exception as db_err:
+        if conn:
             conn.close()
-            if docs:
-                return docs
-        except Exception as db_err:
-            print(f"pgvector iFixit search failed: {db_err}")
-            if conn:
-                conn.close()
-
-    # Fallback to firestore mock
-    print("Falling back to Firestore mock search for iFixit")
-    cache_ref = get_db().collection("ifixit_cache").limit(3)
-    results = cache_ref.stream()
-    
-    docs = []
-    for doc in results:
-        data = doc.to_dict()
-        if data.get("expires_at") and data["expires_at"].astimezone(datetime.timezone.utc) > datetime.datetime.now(datetime.timezone.utc):
-            docs.append(data)
-            
-    return docs
+        raise Exception(f"pgvector iFixit search failed: {db_err}")

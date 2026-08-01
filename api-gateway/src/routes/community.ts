@@ -1,7 +1,10 @@
 import { FastifyInstance } from 'fastify';
-import { firestore } from '../lib/firebase';
+import { db } from '../lib/db';
+import { forumThreads, forumPosts } from '../lib/schema';
 import { verifyAuth, optionalAuth } from '../lib/auth';
-import { FieldValue } from 'firebase-admin/firestore';
+import { eq, desc, asc } from 'drizzle-orm';
+import { randomUUID } from 'crypto';
+import { firestore } from '../lib/firebase';
 
 export default async function communityRoutes(fastify: FastifyInstance) {
 
@@ -13,12 +16,11 @@ export default async function communityRoutes(fastify: FastifyInstance) {
         return reply.status(400).send({ error: 'manualId is required' });
       }
 
-      const snapshot = await firestore.collection('forum_threads')
-        .where('manualId', '==', query.manualId)
-        .orderBy('createdAt', 'desc')
-        .get();
+      // We use manualId to search via the linked product, but for simplicity assuming productId is manualId or similar in the query context for this MVP route
+      const threads = await db.select().from(forumThreads)
+        .where(eq(forumThreads.productId, query.manualId))
+        .orderBy(desc(forumThreads.createdAt));
 
-      const threads = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
       return reply.send({ data: threads });
     } catch (error) {
       request.log.error({ error }, 'Failed to fetch threads');
@@ -36,35 +38,27 @@ export default async function communityRoutes(fastify: FastifyInstance) {
         return reply.status(400).send({ error: 'Missing required fields' });
       }
 
-      const newThreadRef = firestore.collection('forum_threads').doc();
-      const now = new Date().toISOString();
-      const threadData = {
-        manualId: body.manualId,
-        userId: user.uid,
+      const threadId = randomUUID();
+      await db.insert(forumThreads).values({
+        id: threadId,
+        productId: body.manualId, // Mapping manualId directly for now
+        authorId: user.uid,
         title: body.title,
-        body: body.body,
-        isPinned: false,
         isSolved: false,
-        replyCount: 0,
-        createdAt: now,
-        updatedAt: now,
-        author: {
-          name: user.name || user.email || 'Anonymous',
-          image: user.picture || null
-        }
-      };
+      });
 
-      const statsRef = firestore.collection('product_stats').doc(body.manualId);
-      const batch = firestore.batch();
-      batch.set(newThreadRef, threadData);
-      batch.set(statsRef, {
-        manualId: body.manualId,
-        threadCount: FieldValue.increment(1),
-        updatedAt: now
-      }, { merge: true });
-      await batch.commit();
+      // Insert initial post
+      const postId = randomUUID();
+      await db.insert(forumPosts).values({
+        id: postId,
+        threadId: threadId,
+        authorId: user.uid,
+        content: body.body,
+        upvotes: 0,
+        isSolution: false,
+      });
 
-      return reply.send({ data: { id: newThreadRef.id, ...threadData } });
+      return reply.send({ data: { id: threadId, title: body.title } });
     } catch (error) {
       request.log.error({ error }, 'Failed to create thread');
       return reply.status(500).send({ error: 'Failed to create thread' });
@@ -76,17 +70,21 @@ export default async function communityRoutes(fastify: FastifyInstance) {
     try {
       const { threadId } = request.params as { threadId: string };
       
-      const threadDoc = await firestore.collection('forum_threads').doc(threadId).get();
-      if (!threadDoc.exists) {
+      const thread = await db.query.forumThreads.findFirst({
+        where: eq(forumThreads.id, threadId)
+      });
+
+      if (!thread) {
         return reply.status(404).send({ error: 'Thread not found' });
       }
 
-      const repliesSnapshot = await firestore.collection('forum_threads').doc(threadId).collection('replies').orderBy('createdAt', 'asc').get();
-      const replies = repliesSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const replies = await db.select().from(forumPosts)
+        .where(eq(forumPosts.threadId, threadId))
+        .orderBy(asc(forumPosts.createdAt));
 
       return reply.send({
         data: {
-          thread: { id: threadDoc.id, ...threadDoc.data() },
+          thread,
           replies
         }
       });
@@ -107,34 +105,19 @@ export default async function communityRoutes(fastify: FastifyInstance) {
         return reply.status(400).send({ error: 'Missing reply body' });
       }
 
-      const threadRef = firestore.collection('forum_threads').doc(threadId);
-      const newReplyRef = threadRef.collection('replies').doc();
-      const now = new Date().toISOString();
-
+      const newReplyId = randomUUID();
       const replyData = {
+        id: newReplyId,
         threadId,
-        userId: user.uid,
-        body: body.body,
+        authorId: user.uid,
+        content: body.body,
+        upvotes: 0,
         isSolution: false,
-        createdAt: now,
-        updatedAt: now,
-        author: {
-          name: user.name || user.email || 'Anonymous',
-          image: user.picture || null
-        }
       };
 
-      // Batch write to update thread replyCount and add reply
-      const batch = firestore.batch();
-      batch.set(newReplyRef, replyData);
-      batch.update(threadRef, {
-        replyCount: FieldValue.increment(1),
-        updatedAt: now
-      });
+      await db.insert(forumPosts).values(replyData);
 
-      await batch.commit();
-
-      return reply.send({ data: { id: newReplyRef.id, ...replyData } });
+      return reply.send({ data: replyData });
     } catch (error) {
       request.log.error({ error }, 'Failed to post reply');
       return reply.status(500).send({ error: 'Failed to post reply' });
@@ -147,31 +130,26 @@ export default async function communityRoutes(fastify: FastifyInstance) {
       const user = request.user!;
       const { threadId, replyId } = request.params as { threadId: string; replyId: string };
 
-      const threadRef = firestore.collection('forum_threads').doc(threadId);
-      const threadDoc = await threadRef.get();
+      const thread = await db.query.forumThreads.findFirst({
+        where: eq(forumThreads.id, threadId)
+      });
 
-      if (!threadDoc.exists) {
+      if (!thread) {
         return reply.status(404).send({ error: 'Thread not found' });
       }
 
-      // Check ownership
-      if (threadDoc.data()?.userId !== user.uid) {
-        return reply.status(403).send({ error: 'Only the thread owner can mark a solution' });
+      // Check ownership (Assuming the OP marks the solution)
+      if (thread.authorId !== user.uid && user.role !== 'admin') {
+        return reply.status(403).send({ error: 'Only the thread owner or admin can mark a solution' });
       }
 
-      const replyRef = threadRef.collection('replies').doc(replyId);
-      const replyDoc = await replyRef.get();
-
-      if (!replyDoc.exists) {
-        return reply.status(404).send({ error: 'Reply not found' });
-      }
-
-      const now = new Date().toISOString();
-      const batch = firestore.batch();
-      batch.update(replyRef, { isSolution: true, updatedAt: now });
-      batch.update(threadRef, { isSolved: true, updatedAt: now });
-
-      await batch.commit();
+      await db.update(forumPosts)
+        .set({ isSolution: true })
+        .where(eq(forumPosts.id, replyId));
+        
+      await db.update(forumThreads)
+        .set({ isSolved: true })
+        .where(eq(forumThreads.id, threadId));
 
       return reply.send({ data: { success: true } });
     } catch (error) {
@@ -179,6 +157,7 @@ export default async function communityRoutes(fastify: FastifyInstance) {
       return reply.status(500).send({ error: 'Failed to mark solution' });
     }
   });
+
   // GET /reviews
   fastify.get('/reviews', { preHandler: optionalAuth }, async (request, reply) => {
     try {
@@ -193,6 +172,7 @@ export default async function communityRoutes(fastify: FastifyInstance) {
         .get();
 
       const reviews = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
       return reply.send({ data: reviews });
     } catch (error) {
       request.log.error({ error }, 'Failed to fetch reviews');
@@ -204,79 +184,77 @@ export default async function communityRoutes(fastify: FastifyInstance) {
   fastify.post('/reviews', { preHandler: verifyAuth }, async (request, reply) => {
     try {
       const user = request.user!;
-      const body = request.body as { manualId: string; title?: string | null; body: string; rating: number };
+      const body = request.body as { manualId: string; rating: number; title: string | null; body: string };
 
-      if (!body.manualId || !body.body || !body.rating) {
+      if (!body.manualId || !body.rating || !body.body) {
         return reply.status(400).send({ error: 'Missing required fields' });
       }
 
-      const newReviewRef = firestore.collection('product_reviews').doc();
-      const now = new Date().toISOString();
+      const reviewId = randomUUID();
+      const userDoc = await firestore.collection('users').doc(user.uid).get();
+      const userData = userDoc.data() || {};
+      
       const reviewData = {
+        id: reviewId,
         manualId: body.manualId,
         userId: user.uid,
-        title: body.title || null,
-        body: body.body,
         rating: body.rating,
+        title: body.title,
+        body: body.body,
         helpfulCount: 0,
-        createdAt: now,
-        updatedAt: now,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
         author: {
-          name: user.name || user.email || 'Anonymous',
-          image: user.picture || null
+          name: userData.displayName || user.name || 'Anonymous',
+          image: userData.avatarUrl || user.picture || null,
         }
       };
 
+      await firestore.collection('product_reviews').doc(reviewId).set(reviewData);
+
+      // Update product_stats
       const statsRef = firestore.collection('product_stats').doc(body.manualId);
+      await firestore.runTransaction(async (t) => {
+        const statsDoc = await t.get(statsRef);
+        const stats = statsDoc.exists ? statsDoc.data()! : { avgRating: 0, reviewCount: 0, threadCount: 0 };
+        
+        const newCount = stats.reviewCount + 1;
+        const newTotal = (stats.avgRating * stats.reviewCount) + body.rating;
+        const newAvg = newTotal / newCount;
 
-      await firestore.runTransaction(async (transaction) => {
-        const statsDoc = await transaction.get(statsRef);
-        let newReviewCount = 1;
-        let newTotalRating = body.rating;
-        let newThreadCount = 0;
-
-        if (statsDoc.exists) {
-          const data = statsDoc.data()!;
-          newReviewCount = (data.reviewCount || 0) + 1;
-          newTotalRating = (data.totalRating || 0) + body.rating;
-          newThreadCount = data.threadCount || 0;
-        }
-
-        const newAvgRating = newTotalRating / newReviewCount;
-
-        transaction.set(statsRef, {
-          manualId: body.manualId,
-          reviewCount: newReviewCount,
-          totalRating: newTotalRating,
-          avgRating: newAvgRating,
-          threadCount: newThreadCount,
-          updatedAt: now
-        }, { merge: true });
-
-        transaction.set(newReviewRef, reviewData);
+        t.set(statsRef, { ...stats, avgRating: newAvg, reviewCount: newCount }, { merge: true });
       });
 
-      return reply.send({ data: { id: newReviewRef.id, ...reviewData } });
+      return reply.send({ data: reviewData });
     } catch (error) {
-      request.log.error({ error }, 'Failed to create review');
-      return reply.status(500).send({ error: 'Failed to create review' });
+      request.log.error({ error }, 'Failed to submit review');
+      return reply.status(500).send({ error: 'Failed to submit review' });
     }
   });
 
-  // POST /reviews/:reviewId/helpful
-  fastify.post('/reviews/:reviewId/helpful', { preHandler: verifyAuth }, async (request, reply) => {
+  // POST /reviews/:id/helpful
+  fastify.post('/reviews/:id/helpful', { preHandler: verifyAuth }, async (request, reply) => {
     try {
-      const { reviewId } = request.params as { reviewId: string };
-      const reviewRef = firestore.collection('product_reviews').doc(reviewId);
-      
-      await reviewRef.update({
-        helpfulCount: FieldValue.increment(1)
+      const { id } = request.params as { id: string };
+      const user = request.user!;
+      const helpfulRef = firestore.collection('product_reviews').doc(id).collection('helpful').doc(user.uid);
+      const reviewRef = firestore.collection('product_reviews').doc(id);
+
+      await firestore.runTransaction(async (t) => {
+        const helpfulDoc = await t.get(helpfulRef);
+        if (!helpfulDoc.exists) {
+          t.set(helpfulRef, { createdAt: new Date().toISOString() });
+          const reviewDoc = await t.get(reviewRef);
+          if (reviewDoc.exists) {
+            t.update(reviewRef, { helpfulCount: (reviewDoc.data()?.helpfulCount || 0) + 1 });
+          }
+        }
       });
 
-      return reply.send({ data: { success: true } });
+      return reply.send({ success: true });
     } catch (error) {
-      request.log.error({ error }, 'Failed to mark review as helpful');
-      return reply.status(500).send({ error: 'Failed to mark review as helpful' });
+      request.log.error({ error }, 'Failed to mark review helpful');
+      return reply.status(500).send({ error: 'Failed to mark review helpful' });
     }
   });
 }

@@ -17,7 +17,8 @@
     "drizzle-orm": "^0.45.2",
     "fastify": "^4.26.2",
     "firebase-admin": "^12.1.0",
-    "pg": "^8.11.5"
+    "pg": "^8.11.5",
+    "@fastify/rate-limit": "^9.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.7",

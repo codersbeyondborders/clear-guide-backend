@@ -4,6 +4,7 @@ import { db } from '../lib/db';
 import { manuals } from '../lib/schema';
 import { verifyAuth, requireRole } from '../lib/auth';
 import { dispatchToAgent } from '../lib/agentClient';
+import { firestore } from '../lib/firebase';
 
 let tasksClient: CloudTasksClient | null = null;
 try {
@@ -96,6 +97,58 @@ export default async function (fastify: FastifyInstance) {
       } catch (error) {
         request.log.error({ err: error }, 'Failed to process manual ingestion');
         return reply.status(500).send({ error: 'Failed to process manual ingestion' });
+      }
+    }
+  );
+
+  fastify.post(
+    '/pubsub/video-generation',
+    async (request, reply) => {
+      try {
+        const body = request.body as any;
+        if (!body.message || !body.message.data) {
+          return reply.status(400).send('Bad Request: Invalid Pub/Sub message format');
+        }
+        
+        const payloadStr = Buffer.from(body.message.data, 'base64').toString('utf8');
+        const payload = JSON.parse(payloadStr);
+
+        if (payload.type !== 'VideoGenerationRequestedEvent') {
+          return reply.status(200).send('Ignored: Not a video generation event');
+        }
+
+        const { manualId, title, steps } = payload;
+        
+        const aiWorkerUrl = process.env.AGENT_VIDEO_URL || (process.env.AI_AGENT_URL 
+          ? process.env.AI_AGENT_URL.replace('/process-manual', '/generate-video') 
+          : 'http://localhost:8000/generate-video');
+
+        const result = await dispatchToAgent(aiWorkerUrl, { manualId, procedureTitle: title, repairSteps: steps });
+        
+        if (result && result.data) {
+           await firestore.collection('manuals').doc(manualId).set({
+             videoData: result.data,
+             videoGenerationStatus: 'completed',
+             updatedAt: new Date()
+           }, { merge: true });
+        }
+
+        return reply.status(200).send('OK');
+      } catch (error) {
+        request.log.error({ err: error }, 'Failed to handle VideoGenerationRequestedEvent');
+        try {
+           const body = request.body as any;
+           if (body.message && body.message.data) {
+             const payload = JSON.parse(Buffer.from(body.message.data, 'base64').toString('utf8'));
+             if (payload.manualId) {
+               await firestore.collection('manuals').doc(payload.manualId).set({
+                 videoGenerationStatus: 'error'
+               }, { merge: true });
+             }
+           }
+        } catch(e) {}
+
+        return reply.status(500).send('Error processing video generation');
       }
     }
   );

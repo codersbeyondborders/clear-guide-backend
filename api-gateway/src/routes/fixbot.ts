@@ -1,4 +1,5 @@
 import { FastifyInstance } from 'fastify';
+import { firestore } from '../lib/firebase';
 
 export default async function fixbotRoutes(fastify: FastifyInstance) {
   // POST /api/fixbot/chat
@@ -44,6 +45,20 @@ export default async function fixbotRoutes(fastify: FastifyInstance) {
       }
 
       const data = await response.json();
+
+      if (message) {
+        try {
+          await firestore.collection('manual_analytics_events').add({
+            type: 'chat_query',
+            query: message,
+            manualId: body?.manualId || 'general',
+            userSessionId: body?.userSessionId || 'unknown',
+            createdAt: new Date().toISOString()
+          });
+        } catch (analyticsErr) {
+          request.log.error({ err: analyticsErr }, 'Failed to log fixbot chat analytics');
+        }
+      }
 
       return reply.send({
         status: 'success',

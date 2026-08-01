@@ -9,6 +9,7 @@ import hubRoutes from './routes/hub';
 import ifixitRoutes from './routes/ifixit';
 import fixbotRoutes from './routes/fixbot';
 import communityRoutes from './routes/community';
+import rateLimit from '@fastify/rate-limit';
 const fastify = Fastify({
   logger: true
 });
@@ -28,6 +29,12 @@ fastify.register(multipart, {
 
 fastify.get('/health', async () => {
   return { status: 'ok', service: 'api-gateway' };
+});
+
+fastify.register(rateLimit, {
+  global: true,
+  max: 100,
+  timeWindow: '1 minute'
 });
 
 // Register routes cleanly
